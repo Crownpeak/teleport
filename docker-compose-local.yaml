@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  # Teleport Auth and Proxy (all-in-one for local testing)
+  teleport:
+    build:
+      context: .
+      dockerfile: Dockerfile.local
+    container_name: teleport-local
+    hostname: teleport.local
+    ports:
+      - "3023:3023"   # SSH proxy
+      - "3024:3024"   # SSH reverse tunnel
+      - "3025:3025"   # Auth service
+      - "3080:3080"   # Web UI and API
+    volumes:
+      - ./teleport-data:/var/lib/teleport
+      - ./teleport-config:/etc/teleport
+      - ./build:/opt/teleport-build:ro  # Mount built binaries if available
+    environment:
+      - TELEPORT_CONFIG_PATH=/etc/teleport/teleport.yaml
+    command: ["/usr/local/bin/teleport", "start", "--config=/etc/teleport/teleport.yaml", "--diag-addr="]
+    networks:
+      - teleport-network
+    restart: unless-stopped
+
+volumes:
+  teleport-data:
+    driver: local
+
+networks:
+  teleport-network:
+    driver: bridge
