@@ -1,0 +1,193 @@
+# Dockerfile for building and running Teleport OSS locally with maximum caching
+# This builds everything including web UI, but caches aggressively for fast rebuilds
+#
+# Build stages:
+#   1. builder-base: System dependencies (Go, Rust, Node.js) - cached indefinitely
+#   2. go-deps: Go module download - cached until go.mod/go.sum change
+#   3. js-deps: Node/pnpm dependencies - cached until package files change
+#   4. wasm-builder: Build ironrdp wasm module - cached until Rust/web source changes
+#   5. ui-builder: Build web UI - cached until web/ changes
+#   6. go-builder: Build Go binaries - cached until *.go changes
+#   7. runtime: Final minimal image
+
+##############################################################################
+# Stage 1: Base builder with all system dependencies (cached indefinitely)
+##############################################################################
+FROM golang:1.23-bullseye AS builder-base
+
+ENV GOTOOLCHAIN=auto
+
+# Install all build dependencies in one layer
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+    git \
+    libpam0g-dev \
+    libfido2-dev \
+    pkg-config \
+    zip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Add wasm32 target for Rust
+RUN rustup target add wasm32-unknown-unknown
+
+# Install Node.js
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -y nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
+##############################################################################
+# Stage 2: Download Go dependencies (cached until go.mod/go.sum change)
+##############################################################################
+FROM builder-base AS go-deps
+
+WORKDIR /teleport
+
+COPY go.mod go.sum ./
+COPY api/go.mod api/go.sum ./api/
+
+RUN go mod download
+
+##############################################################################
+# Stage 3: Install JS dependencies (cached until package files change)
+##############################################################################
+FROM builder-base AS js-deps
+
+WORKDIR /teleport
+
+# Copy package files and pnpm config
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .pnpmfile.cjs .npmrc ./
+
+# Copy web directory structure needed for pnpm workspace
+COPY web/patches ./web/patches
+COPY web/packages/design/package.json ./web/packages/design/
+COPY web/packages/teleport/package.json ./web/packages/teleport/
+COPY web/packages/shared/package.json ./web/packages/shared/
+COPY web/packages/build/package.json ./web/packages/build/
+COPY web/packages/teleterm/package.json ./web/packages/teleterm/
+
+# Install pnpm and dependencies
+RUN corepack enable pnpm && \
+    pnpm install --frozen-lockfile
+
+##############################################################################
+# Stage 4: Build wasm module (cached until Rust source changes)
+##############################################################################
+FROM builder-base AS wasm-builder
+
+WORKDIR /teleport
+
+# Copy Cargo files
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY lib/srv/desktop/rdp/rdpclient ./lib/srv/desktop/rdp/rdpclient
+COPY web/packages/shared/libs/ironrdp ./web/packages/shared/libs/ironrdp
+
+# Install wasm tools with specific version matching Cargo.lock
+RUN cargo install wasm-bindgen-cli --version 0.2.101 --locked && \
+    cargo install wasm-opt --locked
+
+# Build ironrdp wasm
+RUN RUSTFLAGS='--cfg getrandom_backend="wasm_js"' \
+    cargo build --package ironrdp --lib --target wasm32-unknown-unknown --release && \
+    wasm-opt target/wasm32-unknown-unknown/release/ironrdp.wasm \
+        -o target/wasm32-unknown-unknown/release/ironrdp.wasm -O && \
+    mkdir -p web/packages/shared/libs/ironrdp/pkg && \
+    wasm-bindgen target/wasm32-unknown-unknown/release/ironrdp.wasm \
+        --out-dir web/packages/shared/libs/ironrdp/pkg \
+        --typescript --target web && \
+    echo '{"name":"ironrdp","version":"0.1.0","module":"ironrdp.js","types":"ironrdp.d.ts","files":["ironrdp_bg.wasm","ironrdp.js","ironrdp.d.ts"],"sideEffects":["./snippets/*"]}' \
+        > web/packages/shared/libs/ironrdp/pkg/package.json
+
+##############################################################################
+# Stage 5: Build web UI (cached until web/ source changes)
+##############################################################################
+FROM js-deps AS ui-builder
+
+WORKDIR /teleport
+
+# Copy wasm artifacts from wasm-builder (already built)
+COPY --from=wasm-builder /teleport/web/packages/shared/libs/ironrdp/pkg ./web/packages/shared/libs/ironrdp/pkg
+
+# Copy all root tsconfig files for TypeScript path resolution
+COPY tsconfig.json tsconfig.base.json tsconfig.node.json ./
+
+# Copy generated protobuf TypeScript files (required by web UI)
+COPY gen ./gen
+
+# Copy web source code
+COPY web ./web
+
+# Create a stub Makefile to satisfy the build script's make call
+# The wasm artifacts already exist, so make will find them and skip the build
+RUN echo -e '.PHONY: build-ironrdp-wasm\nbuild-ironrdp-wasm:\n\t@echo "Wasm already built, skipping..."' > Makefile
+
+# Build web UI (the build-wasm script will call make, find existing wasm, and proceed)
+RUN pnpm build-ui-oss
+
+##############################################################################
+# Stage 6: Build Go binaries (cached until *.go changes)
+##############################################################################
+FROM go-deps AS go-builder
+
+WORKDIR /teleport
+
+# Copy all source code
+COPY . .
+
+# Copy webassets from ui-builder (must be after COPY . to overwrite any local webassets)
+COPY --from=ui-builder /teleport/webassets ./webassets
+
+# Create SHA marker file to prevent webassets rebuild
+# The build script checks this file to determine if webassets need rebuilding
+# Calculate SHA the same way the build script does and save it
+RUN find ./web ./package.json ./pnpm-lock.yaml \
+    -not \( -type d \( -name node_modules -o -name .swc -o -path '*ironrdp/pkg*' -o -name .storybook \) -prune \) \
+    -type f -print0 | \
+    LC_ALL=C sort -z | xargs -0 sha512sum | awk '{print $1}' | sha512sum | tr -d ' -' > webassets/oss-sha
+
+# Build all Go binaries with embedded webassets
+RUN GOTOOLCHAIN=auto make all
+
+##############################################################################
+# Stage 7: Runtime image
+##############################################################################
+FROM debian:bullseye-slim
+
+# Install runtime dependencies
+RUN apt-get update && \
+    apt-get install -y \
+    ca-certificates \
+    dumb-init \
+    libfido2-1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy built binaries from go-builder stage
+COPY --from=go-builder /teleport/build/teleport /usr/local/bin/teleport
+COPY --from=go-builder /teleport/build/tctl /usr/local/bin/tctl
+COPY --from=go-builder /teleport/build/tsh /usr/local/bin/tsh
+
+# Create teleport user and directories
+RUN groupadd -r teleport && \
+    useradd -r -g teleport -d /var/lib/teleport -s /bin/bash teleport && \
+    mkdir -p /var/lib/teleport /etc/teleport && \
+    chown -R teleport:teleport /var/lib/teleport /etc/teleport
+
+# Expose ports
+# 3023 - SSH proxy
+# 3024 - SSH reverse tunnel
+# 3025 - Auth service
+# 3080 - Web UI and API
+EXPOSE 3023 3024 3025 3080
+
+# Set working directory
+WORKDIR /var/lib/teleport
+
+# Use dumb-init to handle signals properly
+ENTRYPOINT ["/usr/bin/dumb-init", "--"]
+
+# Default command
+CMD ["/usr/local/bin/teleport", "start"]
