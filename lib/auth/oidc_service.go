@@ -23,7 +23,9 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"log/slog"
+	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -49,16 +51,82 @@ import (
 // ErrOIDCNoRoles results from an OIDC user not having any roles mapped.
 var ErrOIDCNoRoles = trace.AccessDenied("user does not have any roles mapped; check the claims_to_roles configuration in the OIDC connector")
 
-// oidcAuthServiceImpl implements OIDCService interface
-type oidcAuthServiceImpl struct {
-	authServer *Server
+const (
+	// oidcProviderCacheTTL is the duration to cache OIDC provider configurations.
+	// Discovery documents rarely change, so we cache them for 1 hour to reduce
+	// network calls and prevent resource leaks from creating multiple HTTP clients.
+	oidcProviderCacheTTL = 1 * time.Hour
+
+	// oidcHTTPClientTimeout is the timeout for HTTP requests to OIDC providers.
+	oidcHTTPClientTimeout = 30 * time.Second
+)
+
+// cachedOIDCProvider wraps an OIDC provider with its expiration time.
+type cachedOIDCProvider struct {
+	provider  *oidc.Provider
+	expiresAt time.Time
 }
 
-// NewOIDCAuthService creates a new OIDC authentication service
+// oidcAuthServiceImpl implements OIDCService interface
+type oidcAuthServiceImpl struct {
+	authServer    *Server
+	httpClient    *http.Client
+	providerCache sync.Map // map[string]*cachedOIDCProvider
+	cacheTTL      time.Duration
+}
+
+// NewOIDCAuthService creates a new OIDC authentication service with proper
+// HTTP client lifecycle management and provider caching to prevent resource leaks.
 func NewOIDCAuthService(authServer *Server) OIDCService {
 	return &oidcAuthServiceImpl{
 		authServer: authServer,
+		httpClient: &http.Client{
+			Timeout: oidcHTTPClientTimeout,
+			Transport: &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 10,
+				IdleConnTimeout:     90 * time.Second,
+				TLSHandshakeTimeout: 10 * time.Second,
+			},
+		},
+		cacheTTL: oidcProviderCacheTTL,
 	}
+}
+
+// getOIDCProvider retrieves or creates an OIDC provider for the given issuer URL.
+// It caches providers to avoid creating multiple HTTP clients and reduce network calls
+// to the OIDC discovery endpoint.
+func (s *oidcAuthServiceImpl) getOIDCProvider(ctx context.Context, issuerURL string) (*oidc.Provider, error) {
+	// Check cache first
+	if cached, ok := s.providerCache.Load(issuerURL); ok {
+		cp := cached.(*cachedOIDCProvider)
+		if time.Now().Before(cp.expiresAt) {
+			return cp.provider, nil
+		}
+		// Cached provider expired, remove it
+		s.providerCache.Delete(issuerURL)
+	}
+
+	// Create context with our HTTP client
+	ctx = oidc.ClientContext(ctx, s.httpClient)
+
+	// Add timeout for provider creation
+	providerCtx, cancel := context.WithTimeout(ctx, oidcHTTPClientTimeout)
+	defer cancel()
+
+	// Create new provider with HTTP client context
+	provider, err := oidc.NewProvider(providerCtx, issuerURL)
+	if err != nil {
+		return nil, trace.Wrap(err, "failed to create OIDC provider for issuer %q", issuerURL)
+	}
+
+	// Cache the provider
+	s.providerCache.Store(issuerURL, &cachedOIDCProvider{
+		provider:  provider,
+		expiresAt: time.Now().Add(s.cacheTTL),
+	})
+
+	return provider, nil
 }
 
 // CreateOIDCAuthRequest creates an OIDC authentication request
@@ -108,10 +176,10 @@ func (s *oidcAuthServiceImpl) createOIDCAuthRequest(ctx context.Context, req typ
 		return nil, trace.Wrap(err)
 	}
 
-	// Create OIDC provider for endpoint discovery
-	provider, err := oidc.NewProvider(ctx, connector.GetIssuerURL())
+	// Get OIDC provider (cached) for endpoint discovery
+	provider, err := s.getOIDCProvider(ctx, connector.GetIssuerURL())
 	if err != nil {
-		return nil, trace.Wrap(err, "failed to create OIDC provider")
+		return nil, trace.Wrap(err)
 	}
 
 	// Create OAuth2 config with discovered endpoints
@@ -317,10 +385,10 @@ func (s *oidcAuthServiceImpl) ValidateOIDCAuthRedirect(ctx context.Context, diag
 		"redirect_url", redirectURL,
 		"proxy_address", authRequest.ProxyAddress)
 
-	// Create OIDC provider for endpoint discovery and token verification
-	provider, err := oidc.NewProvider(ctx, connector.GetIssuerURL())
+	// Get OIDC provider (cached) for endpoint discovery and token verification
+	provider, err := s.getOIDCProvider(ctx, connector.GetIssuerURL())
 	if err != nil {
-		return nil, trace.Wrap(err, "failed to create OIDC provider")
+		return nil, trace.Wrap(err)
 	}
 
 	// Create OAuth2 config with discovered endpoints
