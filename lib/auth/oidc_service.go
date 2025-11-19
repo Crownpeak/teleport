@@ -329,11 +329,81 @@ func validateOIDCAuthCallbackHelper(ctx context.Context, m oidcManager, diagCtx 
 	return auth, nil
 }
 
-// ValidateOIDCAuthRedirect validates OIDC auth callback redirect
+// oidcCallbackParams holds validated OIDC callback parameters extracted from the redirect.
+type oidcCallbackParams struct {
+	code        string
+	state       string
+	authRequest *types.OIDCAuthRequest
+	connector   types.OIDCConnector
+	redirectURL string
+}
+
+// oidcTokenResult holds the result of OIDC token exchange.
+type oidcTokenResult struct {
+	token      *oauth2.Token
+	rawIDToken string
+}
+
+// oidcClaimsResult holds verified claims extracted from the OIDC ID token.
+type oidcClaimsResult struct {
+	claims   map[string]interface{}
+	username string
+	roles    []string
+}
+
+// ValidateOIDCAuthRedirect validates OIDC auth callback redirect.
+// This function orchestrates the OIDC authentication flow by coordinating
+// multiple smaller operations: parameter extraction, token exchange, claims
+// verification, user authentication, and response building.
 func (s *oidcAuthServiceImpl) ValidateOIDCAuthRedirect(ctx context.Context, diagCtx *SSODiagContext, q url.Values) (*authclient.OIDCAuthResponse, error) {
 	logger := s.authServer.logger.With(teleport.ComponentKey, "oidc")
 
-	// Check for OAuth2 error response
+	// Extract and validate callback parameters
+	params, err := s.extractCallbackParams(ctx, diagCtx, logger, q)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	// Exchange authorization code for tokens
+	tokenRes, err := s.exchangeOIDCToken(ctx, logger, params)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	// Verify ID token and extract claims
+	claimsRes, err := s.verifyAndExtractClaims(ctx, logger, params, tokenRes)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	// Validate nonce to prevent token replay attacks
+	if err := s.validateOIDCNonce(ctx, logger, params.authRequest, claimsRes.claims); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	// Store claims in diagnostic context for audit logging
+	diagCtx.Info.OIDCClaims = claimsRes.claims
+
+	// Authenticate user and create/update if needed
+	userState, createParams, err := s.authenticateOIDCUser(ctx, diagCtx, logger, params, claimsRes)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	// Build auth response with sessions and certificates
+	response, err := s.buildOIDCAuthResponse(ctx, logger, params, claimsRes, userState, createParams)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return response, nil
+}
+
+// extractCallbackParams extracts and validates OIDC callback parameters.
+// It handles OAuth2 error responses, validates required parameters (code, state),
+// retrieves the stored auth request, and loads the OIDC connector configuration.
+func (s *oidcAuthServiceImpl) extractCallbackParams(ctx context.Context, diagCtx *SSODiagContext, logger *slog.Logger, q url.Values) (*oidcCallbackParams, error) {
+	// Check for OAuth2 error response from provider
 	if errParam := q.Get("error"); errParam != "" {
 		// Try to find request so the error gets logged against it
 		state := q.Get("state")
@@ -351,13 +421,14 @@ func (s *oidcAuthServiceImpl) ValidateOIDCAuthRedirect(ctx context.Context, diag
 		return nil, trace.WithUserMessage(oauthErr, "OIDC provider returned error: %v [%v]", errDesc, errParam)
 	}
 
-	// Extract parameters from callback
+	// Extract and validate authorization code
 	code := q.Get("code")
 	if code == "" {
 		oauthErr := trace.OAuth2("invalid_request", "code query param must be set", q)
 		return nil, trace.WithUserMessage(oauthErr, "Invalid parameters received from OIDC provider.")
 	}
 
+	// Extract and validate state token for CSRF protection
 	state := q.Get("state")
 	if state == "" {
 		oauthErr := trace.OAuth2("invalid_request", "missing state query param", q)
@@ -379,13 +450,13 @@ func (s *oidcAuthServiceImpl) ValidateOIDCAuthRedirect(ctx context.Context, diag
 		"ssh_pub_key_len", len(authRequest.SshPublicKey),
 		"tls_pub_key_len", len(authRequest.TlsPublicKey))
 
-	// Get the OIDC connector
+	// Get the OIDC connector configuration
 	connector, err := s.authServer.GetOIDCConnector(ctx, authRequest.ConnectorID, true)
 	if err != nil {
 		return nil, trace.Wrap(err, "Failed to get OIDC connector.")
 	}
 
-	// Determine redirect URL
+	// Determine redirect URL for token exchange
 	redirectURL, err := services.GetRedirectURL(connector, authRequest.ProxyAddress)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -397,95 +468,107 @@ func (s *oidcAuthServiceImpl) ValidateOIDCAuthRedirect(ctx context.Context, diag
 		"redirect_url", redirectURL,
 		"proxy_address", authRequest.ProxyAddress)
 
-	// Get OIDC provider (cached) for endpoint discovery and token verification
-	provider, err := s.getOIDCProvider(ctx, connector.GetIssuerURL())
+	return &oidcCallbackParams{
+		code:        code,
+		state:       state,
+		authRequest: authRequest,
+		connector:   connector,
+		redirectURL: redirectURL,
+	}, nil
+}
+
+// exchangeOIDCToken exchanges the authorization code for OAuth2 tokens.
+// It creates an OAuth2 config with the OIDC provider endpoints, adds PKCE
+// verification if needed, and exchanges the code for an access token and ID token.
+func (s *oidcAuthServiceImpl) exchangeOIDCToken(ctx context.Context, logger *slog.Logger, params *oidcCallbackParams) (*oidcTokenResult, error) {
+	// Get OIDC provider (cached) for endpoint discovery
+	provider, err := s.getOIDCProvider(ctx, params.connector.GetIssuerURL())
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
 	// Create OAuth2 config with discovered endpoints
 	oauth2Config := oauth2.Config{
-		ClientID:     connector.GetClientID(),
-		ClientSecret: connector.GetClientSecret(),
-		RedirectURL:  redirectURL,
+		ClientID:     params.connector.GetClientID(),
+		ClientSecret: params.connector.GetClientSecret(),
+		RedirectURL:  params.redirectURL,
 		Endpoint:     provider.Endpoint(),
-		Scopes:       connector.GetScope(),
+		Scopes:       params.connector.GetScope(),
 	}
 
 	// Debug logging (without exposing client secret)
 	logger.InfoContext(ctx, "OIDC token exchange",
-		"client_id", connector.GetClientID(),
-		"client_secret_length", len(connector.GetClientSecret()),
-		"redirect_url", redirectURL,
+		"client_id", params.connector.GetClientID(),
+		"client_secret_length", len(params.connector.GetClientSecret()),
+		"redirect_url", params.redirectURL,
 		"token_url", oauth2Config.Endpoint.TokenURL,
-		"issuer_url", connector.GetIssuerURL())
+		"issuer_url", params.connector.GetIssuerURL())
 
-	// Exchange code for token with timeout to prevent hanging on slow/unresponsive providers
+	// Prepare token exchange options with PKCE verifier if provided
 	var tokenOpts []oauth2.AuthCodeOption
-	if authRequest.PkceVerifier != "" {
-		tokenOpts = append(tokenOpts, oauth2.VerifierOption(authRequest.PkceVerifier))
+	if params.authRequest.PkceVerifier != "" {
+		tokenOpts = append(tokenOpts, oauth2.VerifierOption(params.authRequest.PkceVerifier))
 	}
 
 	// Add explicit timeout for token exchange to prevent indefinite hangs
 	exchangeCtx, exchangeCancel := context.WithTimeout(ctx, oidcHTTPClientTimeout)
 	defer exchangeCancel()
 
-	token, err := oauth2Config.Exchange(exchangeCtx, code, tokenOpts...)
+	// Exchange authorization code for tokens
+	token, err := oauth2Config.Exchange(exchangeCtx, params.code, tokenOpts...)
 	if err != nil {
 		logger.ErrorContext(ctx, "Token exchange failed",
 			"error", err,
-			"client_id", connector.GetClientID(),
-			"redirect_url", redirectURL)
+			"client_id", params.connector.GetClientID(),
+			"redirect_url", params.redirectURL)
 		return nil, trace.Wrap(err, "failed to exchange code for token")
 	}
 
-	// Extract ID token
+	// Extract ID token from token response
 	rawIDToken, ok := token.Extra("id_token").(string)
 	if !ok {
 		return nil, trace.BadParameter("no id_token in token response")
 	}
 
-	// Verify ID token with timeout to prevent hanging on JWKS endpoint calls
+	return &oidcTokenResult{
+		token:      token,
+		rawIDToken: rawIDToken,
+	}, nil
+}
+
+// verifyAndExtractClaims verifies the ID token signature and extracts claims.
+// It uses the OIDC provider's JWKS keys to verify the token signature,
+// extracts claims from the verified token, and maps claims to username and roles.
+func (s *oidcAuthServiceImpl) verifyAndExtractClaims(ctx context.Context, logger *slog.Logger, params *oidcCallbackParams, tokenRes *oidcTokenResult) (*oidcClaimsResult, error) {
+	// Get OIDC provider for token verification
+	provider, err := s.getOIDCProvider(ctx, params.connector.GetIssuerURL())
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	// Create ID token verifier with client ID validation
 	verifier := provider.Verifier(&oidc.Config{
-		ClientID: connector.GetClientID(),
+		ClientID: params.connector.GetClientID(),
 	})
 
 	// Add explicit timeout for ID token verification (may fetch JWKS keys)
 	verifyCtx, verifyCancel := context.WithTimeout(ctx, oidcHTTPClientTimeout)
 	defer verifyCancel()
 
-	idToken, err := verifier.Verify(verifyCtx, rawIDToken)
+	// Verify ID token signature and claims
+	idToken, err := verifier.Verify(verifyCtx, tokenRes.rawIDToken)
 	if err != nil {
 		return nil, trace.Wrap(err, "failed to verify ID token")
 	}
 
-	// Extract claims
+	// Extract claims from verified ID token
 	var claims map[string]interface{}
 	if err := idToken.Claims(&claims); err != nil {
 		return nil, trace.Wrap(err, "failed to extract claims")
 	}
 
-	// Validate nonce to prevent ID token replay attacks
-	// The nonce in the ID token must match the one we sent in the auth request
-	if authRequest.Nonce != "" {
-		claimNonce, ok := claims["nonce"].(string)
-		if !ok {
-			return nil, trace.BadParameter("ID token missing nonce claim")
-		}
-		if claimNonce != authRequest.Nonce {
-			logger.WarnContext(ctx, "Nonce validation failed",
-				"expected", authRequest.Nonce,
-				"got", claimNonce)
-			return nil, trace.AccessDenied("nonce mismatch: potential token replay attack detected")
-		}
-		logger.DebugContext(ctx, "Nonce validation successful")
-	}
-
-	// Store claims in diagnostic context
-	diagCtx.Info.OIDCClaims = claims
-
-	// Determine username from claims
-	username, err := s.getUsernameFromClaims(connector, claims)
+	// Determine username from claims based on connector configuration
+	username, err := s.getUsernameFromClaims(params.connector, claims)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -494,68 +577,119 @@ func (s *oidcAuthServiceImpl) ValidateOIDCAuthRedirect(ctx context.Context, diag
 		"username", username,
 		"num_claims", len(claims))
 
-	// Map claims to roles
-	roles := s.mapClaimsToRoles(connector, claims)
+	// Map claims to Teleport roles
+	roles := s.mapClaimsToRoles(params.connector, claims)
 	if len(roles) == 0 {
 		// Use generic error message - don't reveal username
 		return nil, trace.Wrap(ErrOIDCNoRoles)
 	}
 
+	return &oidcClaimsResult{
+		claims:   claims,
+		username: username,
+		roles:    roles,
+	}, nil
+}
+
+// validateOIDCNonce validates the nonce claim in the ID token to prevent replay attacks.
+// The nonce in the ID token must match the nonce sent in the authorization request.
+// This is a critical security check to prevent token replay attacks.
+func (s *oidcAuthServiceImpl) validateOIDCNonce(ctx context.Context, logger *slog.Logger, authRequest *types.OIDCAuthRequest, claims map[string]interface{}) error {
+	// Nonce validation is only required if nonce was sent in the auth request
+	if authRequest.Nonce == "" {
+		return nil
+	}
+
+	// Extract nonce from claims
+	claimNonce, ok := claims["nonce"].(string)
+	if !ok {
+		return trace.BadParameter("ID token missing nonce claim")
+	}
+
+	// Verify nonce matches the one sent in the auth request
+	if claimNonce != authRequest.Nonce {
+		logger.WarnContext(ctx, "Nonce validation failed",
+			"expected", authRequest.Nonce,
+			"got", claimNonce)
+		return trace.AccessDenied("nonce mismatch: potential token replay attack detected")
+	}
+
+	logger.DebugContext(ctx, "Nonce validation successful")
+	return nil
+}
+
+// authenticateOIDCUser handles user authentication, role mapping, and user creation/update.
+// It calculates user attributes, applies login rules, creates or updates the user,
+// calls login hooks, and retrieves the final user state.
+func (s *oidcAuthServiceImpl) authenticateOIDCUser(ctx context.Context, diagCtx *SSODiagContext, logger *slog.Logger, params *oidcCallbackParams, claimsRes *oidcClaimsResult) (services.UserState, *CreateOIDCUserParams, error) {
 	// Calculate user attributes and apply login rules
-	params, err := s.calculateOIDCUser(ctx, diagCtx, connector, username, roles, claims, authRequest)
+	createParams, err := s.calculateOIDCUser(ctx, diagCtx, params.connector, claimsRes.username, claimsRes.roles, claimsRes.claims, params.authRequest)
 	if err != nil {
 		// Use generic error message
-		return nil, trace.Wrap(err, "Failed to calculate user attributes.")
+		return nil, nil, trace.Wrap(err, "Failed to calculate user attributes.")
 	}
 
+	// Store user creation params in diagnostic context for audit logging
 	diagCtx.Info.CreateUserParams = &types.CreateUserParams{
-		ConnectorName: params.ConnectorName,
-		Username:      params.Username,
-		KubeGroups:    params.KubeGroups,
-		KubeUsers:     params.KubeUsers,
-		Roles:         params.Roles,
-		Traits:        params.Traits,
-		SessionTTL:    types.Duration(params.SessionTTL),
+		ConnectorName: createParams.ConnectorName,
+		Username:      createParams.Username,
+		KubeGroups:    createParams.KubeGroups,
+		KubeUsers:     createParams.KubeUsers,
+		Roles:         createParams.Roles,
+		Traits:        createParams.Traits,
+		SessionTTL:    types.Duration(createParams.SessionTTL),
 	}
 
-	// Create or update user
-	user, err := s.createOIDCUser(ctx, params, authRequest.SSOTestFlow)
+	// Create or update user in the backend
+	user, err := s.createOIDCUser(ctx, createParams, params.authRequest.SSOTestFlow)
 	if err != nil {
-		return nil, trace.Wrap(err, "Failed to create user from provided parameters.")
+		return nil, nil, trace.Wrap(err, "Failed to create user from provided parameters.")
 	}
 
-	// Call login hooks
+	// Call login hooks for custom authentication logic
 	if err := s.authServer.CallLoginHooks(ctx, user); err != nil {
-		return nil, trace.Wrap(err)
+		return nil, nil, trace.Wrap(err)
 	}
 
+	// Get final user state including any modifications from login hooks
 	userState, err := s.authServer.GetUserOrLoginState(ctx, user.GetName())
 	if err != nil {
-		return nil, trace.Wrap(err)
+		return nil, nil, trace.Wrap(err)
 	}
 
-	// In test flow skip signing and creating web sessions
-	if authRequest.SSOTestFlow {
-		diagCtx.Info.Success = true
+	return userState, createParams, nil
+}
+
+// buildOIDCAuthResponse builds the final OIDC authentication response.
+// It creates web sessions and/or SSH/TLS certificates based on the request type,
+// and handles both normal authentication flow and SSO test flow.
+func (s *oidcAuthServiceImpl) buildOIDCAuthResponse(ctx context.Context, logger *slog.Logger, params *oidcCallbackParams, claimsRes *oidcClaimsResult, userState services.UserState, createParams *CreateOIDCUserParams) (*authclient.OIDCAuthResponse, error) {
+	// In test flow, skip signing and creating web sessions
+	if params.authRequest.SSOTestFlow {
 		return &authclient.OIDCAuthResponse{
 			Req: authclient.OIDCAuthRequest{
-				ConnectorID:       authRequest.ConnectorID,
-				CSRFToken:         authRequest.CSRFToken,
-				CreateWebSession:  authRequest.CreateWebSession,
-				ClientRedirectURL: authRequest.ClientRedirectURL,
-				SSHPubKey:         authRequest.SshPublicKey,
-				TLSPubKey:         authRequest.TlsPublicKey,
+				ConnectorID:       params.authRequest.ConnectorID,
+				CSRFToken:         params.authRequest.CSRFToken,
+				CreateWebSession:  params.authRequest.CreateWebSession,
+				ClientRedirectURL: params.authRequest.ClientRedirectURL,
+				SSHPubKey:         params.authRequest.SshPublicKey,
+				TLSPubKey:         params.authRequest.TlsPublicKey,
 			},
 			Identity: types.ExternalIdentity{
-				ConnectorID: connector.GetName(),
-				Username:    username,
+				ConnectorID: params.connector.GetName(),
+				Username:    claimsRes.username,
 			},
-			Username: params.Username,
+			Username: createParams.Username,
 		}, nil
 	}
 
-	// Auth was successful, return session, certificate, etc. to caller
-	return s.makeOIDCAuthResponse(ctx, authRequest, userState, connector.GetName(), username, params.SessionTTL)
+	// For normal authentication, create sessions and certificates
+	response, err := s.makeOIDCAuthResponse(ctx, params.authRequest, userState, params.connector.GetName(), claimsRes.username, createParams.SessionTTL)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return response, nil
 }
 
 // getUsernameFromClaims extracts the username from OIDC claims based on connector configuration
