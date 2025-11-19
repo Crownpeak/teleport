@@ -170,6 +170,14 @@ func (s *oidcAuthServiceImpl) createOIDCAuthRequest(ctx context.Context, req typ
 		return nil, trace.Wrap(err)
 	}
 
+	// Generate nonce for ID token replay protection
+	// The nonce is a random value that will be included in the ID token by the OIDC provider
+	// and must be validated during the callback to prevent token replay attacks
+	nonce, err := utils.CryptoRandomHex(defaults.TokenLenBytes)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
 	// Determine redirect URL
 	redirectURL, err := services.GetRedirectURL(connector, req.ProxyAddress)
 	if err != nil {
@@ -199,6 +207,9 @@ func (s *oidcAuthServiceImpl) createOIDCAuthRequest(ctx context.Context, req typ
 		authURLOpts = append(authURLOpts, oauth2.S256ChallengeOption(req.PkceVerifier))
 	}
 
+	// Add nonce parameter for ID token replay protection (OIDC security best practice)
+	authURLOpts = append(authURLOpts, oauth2.SetAuthURLParam("nonce", nonce))
+
 	// Generate authorization URL
 	authURL := oauth2Config.AuthCodeURL(stateToken, authURLOpts...)
 
@@ -217,6 +228,7 @@ func (s *oidcAuthServiceImpl) createOIDCAuthRequest(ctx context.Context, req typ
 		CreateWebSession:  req.CreateWebSession,
 		ProxyAddress:      req.ProxyAddress,
 		PkceVerifier:      req.PkceVerifier,
+		Nonce:             nonce,
 		SshPublicKey:      req.SshPublicKey,
 		TlsPublicKey:      req.TlsPublicKey,
 		SSOTestFlow:       req.SSOTestFlow,
@@ -443,6 +455,22 @@ func (s *oidcAuthServiceImpl) ValidateOIDCAuthRedirect(ctx context.Context, diag
 	var claims map[string]interface{}
 	if err := idToken.Claims(&claims); err != nil {
 		return nil, trace.Wrap(err, "failed to extract claims")
+	}
+
+	// Validate nonce to prevent ID token replay attacks
+	// The nonce in the ID token must match the one we sent in the auth request
+	if authRequest.Nonce != "" {
+		claimNonce, ok := claims["nonce"].(string)
+		if !ok {
+			return nil, trace.BadParameter("ID token missing nonce claim")
+		}
+		if claimNonce != authRequest.Nonce {
+			logger.WarnContext(ctx, "Nonce validation failed",
+				"expected", authRequest.Nonce,
+				"got", claimNonce)
+			return nil, trace.AccessDenied("nonce mismatch: potential token replay attack detected")
+		}
+		logger.DebugContext(ctx, "Nonce validation successful")
 	}
 
 	// Store claims in diagnostic context
