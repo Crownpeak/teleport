@@ -420,13 +420,17 @@ func (s *oidcAuthServiceImpl) ValidateOIDCAuthRedirect(ctx context.Context, diag
 		"token_url", oauth2Config.Endpoint.TokenURL,
 		"issuer_url", connector.GetIssuerURL())
 
-	// Exchange code for token
+	// Exchange code for token with timeout to prevent hanging on slow/unresponsive providers
 	var tokenOpts []oauth2.AuthCodeOption
 	if authRequest.PkceVerifier != "" {
 		tokenOpts = append(tokenOpts, oauth2.VerifierOption(authRequest.PkceVerifier))
 	}
 
-	token, err := oauth2Config.Exchange(ctx, code, tokenOpts...)
+	// Add explicit timeout for token exchange to prevent indefinite hangs
+	exchangeCtx, exchangeCancel := context.WithTimeout(ctx, oidcHTTPClientTimeout)
+	defer exchangeCancel()
+
+	token, err := oauth2Config.Exchange(exchangeCtx, code, tokenOpts...)
 	if err != nil {
 		logger.ErrorContext(ctx, "Token exchange failed",
 			"error", err,
@@ -441,12 +445,16 @@ func (s *oidcAuthServiceImpl) ValidateOIDCAuthRedirect(ctx context.Context, diag
 		return nil, trace.BadParameter("no id_token in token response")
 	}
 
-	// Verify ID token
+	// Verify ID token with timeout to prevent hanging on JWKS endpoint calls
 	verifier := provider.Verifier(&oidc.Config{
 		ClientID: connector.GetClientID(),
 	})
 
-	idToken, err := verifier.Verify(ctx, rawIDToken)
+	// Add explicit timeout for ID token verification (may fetch JWKS keys)
+	verifyCtx, verifyCancel := context.WithTimeout(ctx, oidcHTTPClientTimeout)
+	defer verifyCancel()
+
+	idToken, err := verifier.Verify(verifyCtx, rawIDToken)
 	if err != nil {
 		return nil, trace.Wrap(err, "failed to verify ID token")
 	}
