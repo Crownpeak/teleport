@@ -20,8 +20,6 @@ package auth
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/base64"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -998,13 +996,4 @@ func (s *oidcAuthServiceImpl) makeOIDCAuthResponse(
 	}
 
 	return &auth, nil
-}
-
-// generateRandomToken generates a random token for CSRF protection
-func generateRandomToken(length int) (string, error) {
-	b := make([]byte, length)
-	if _, err := rand.Read(b); err != nil {
-		return "", trace.Wrap(err)
-	}
-	return base64.URLEncoding.EncodeToString(b), nil
 }
