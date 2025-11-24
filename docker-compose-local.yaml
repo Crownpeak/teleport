@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # Teleport Auth and Proxy (all-in-one for local testing)
   teleport:
