@@ -99,7 +99,21 @@ COPY gen ./gen
 # Copy web source code
 COPY web ./web
 
-# Build web UI (no wasm build needed for v18.5.1)
+# Patch package.json to skip WASM build (not present in v18.5.1)
+RUN sed -i 's/"build": "pnpm build-wasm && vite build"/"build": "vite build"/' web/packages/teleport/package.json && \
+    sed -i 's/"start": "pnpm build-wasm && vite"/"start": "vite"/' web/packages/teleport/package.json
+
+# Fix ES module imports for Node.js compatibility
+RUN sed -i "/import.*rollup-plugin-visualizer/d" web/packages/build/vite/config.ts && \
+    sed -i "/config.plugins.push(visualizer())/d" web/packages/build/vite/config.ts && \
+    sed -i "/import.*vite-plugin-compression/d" web/packages/build/vite/config.ts && \
+    sed -i "/config.plugins.push(/d" web/packages/build/vite/config.ts && \
+    sed -i "/import.*vite-plugin-wasm/d" web/packages/build/vite/config.ts && \
+    sed -i "/wasm()/d" web/packages/build/vite/config.ts && \
+    rm -rf node_modules/.vite* web/packages/*/node_modules/.vite*
+
+# Build web UI (disable compression to avoid plugin issues)
+ENV VITE_DISABLE_COMPRESSION=1
 RUN pnpm build-ui-oss
 
 ##############################################################################

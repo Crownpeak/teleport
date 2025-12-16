@@ -2053,3 +2053,6 @@ resource-docs-up-to-date: must-start-clean/host gen-resource-docs
 		./build.assets/please-run.sh "tctl resource reference docs" "make gen-resource-docs"; \
 		exit 1; \
 	fi
+
+# Include local overrides if present
+-include Makefile.local
