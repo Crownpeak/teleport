@@ -1,4 +1,2 @@
-# Local overrides for v18.5.1 - ironrdp WASM components not present
-.PHONY: build-ironrdp-wasm
-build-ironrdp-wasm:
-	@echo "Skipping ironrdp WASM build (not present in v18.5.1)"
+# Local Makefile overrides
+# This file is intentionally empty - using standard Teleport build process
