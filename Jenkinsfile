@@ -123,25 +123,15 @@ pipeline {
             steps {
                 dir('teleport') {
                     sh '''
-                        echo "=== Creating DEB package inside Docker ==="
+                        echo "=== Creating DEB package on host ==="
                         
                         # Get the version from the Makefile
                         VERSION=$(grep "^VERSION=" Makefile | cut -d= -f2)
                         echo "Teleport version: ${VERSION}"
                         
-                        # Get UID/GID for proper file permissions
-                        export UID=$(id -u)
-                        export GID=$(id -g)
-                        
-                        # Create DEB package using the CentOS 7 buildbox
-                        docker run --rm \
-                            -v "$(pwd)":/go/src/github.com/gravitational/teleport \
-                            -v /tmp:/tmp \
-                            -w /go/src/github.com/gravitational/teleport \
-                            -u ${UID}:${GID} \
-                            -e HOME=/tmp \
-                            ${BUILDBOX_BASE}-centos7:${BUILDBOX_VERSION}-${ARCH} \
-                            make deb
+                        # Run make deb directly on the host where Docker is available
+                        # The build-package.sh script will use Docker to run fpm for packaging
+                        make deb
                         
                         echo "=== DEB package created ==="
                         ls -la build/*.deb
