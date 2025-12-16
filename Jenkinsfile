@@ -19,6 +19,8 @@ pipeline {
         // Teleport buildbox version (must match the version in build.assets/images.mk)
         BUILDBOX_VERSION = 'teleport18'
         BUILDBOX_BASE = 'ghcr.io/gravitational/teleport-buildbox'
+        // Go build parallelism - set to number of CPU cores
+        GOMAXPROCS = '8'
     }
     stages {
         stage('Prepare Workspace') {
@@ -34,9 +36,9 @@ pipeline {
             steps {
                 sshagent(credentials: [GIT_CREDENTIALS_ID]) {
                     sh '''
-                        git clone https://github.com/Crownpeak/teleport
+                        # Shallow clone to speed up checkout
+                        git clone --depth 1 --branch "${CHECKOUT_BRANCH}" https://github.com/Crownpeak/teleport
                         cd teleport
-                        git checkout "${CHECKOUT_BRANCH}"
                         git log -1 --oneline
                     '''
                 }
@@ -47,18 +49,17 @@ pipeline {
                 sh '''
                     echo "=== Pulling pre-built buildbox images from GitHub Container Registry ==="
                     
-                    # Pull the CentOS 7 buildbox (for compiling Go binaries)
-                    docker pull ${BUILDBOX_BASE}-centos7:${BUILDBOX_VERSION}-${ARCH}
-                    
-                    # Pull the Node.js buildbox (for building web UI)
-                    docker pull ${BUILDBOX_BASE}-node:${BUILDBOX_VERSION}
+                    # Pull images in parallel
+                    docker pull ${BUILDBOX_BASE}-centos7:${BUILDBOX_VERSION}-${ARCH} &
+                    docker pull ${BUILDBOX_BASE}-node:${BUILDBOX_VERSION} &
+                    wait
                     
                     echo "=== Buildbox images pulled successfully ==="
                     docker images | grep teleport-buildbox
                 '''
             }
         }
-        stage('Build Web Assets') {
+        stage('Build Web Assets and Binaries') {
             steps {
                 dir('teleport') {
                     sh '''
@@ -69,7 +70,6 @@ pipeline {
                         export GID=$(id -g)
                         
                         # Build webassets using the Node.js buildbox
-                        # This follows the official build process from build.assets/Makefile
                         docker run --rm \
                             -v "$(pwd)":/go/src/github.com/gravitational/teleport \
                             -v /tmp:/tmp \
@@ -80,29 +80,16 @@ pipeline {
                             make ensure-webassets
                         
                         echo "=== Web assets built successfully ==="
-                        ls -la webassets/ || echo "webassets directory not found, checking web/packages"
-                    '''
-                }
-            }
-        }
-        stage('Build Binaries') {
-            steps {
-                dir('teleport') {
-                    sh '''
-                        echo "=== Building Teleport binaries inside Docker ==="
                         
                         # Clean Rust target directory to avoid GLIBC version conflicts
-                        # The Node.js buildbox has newer GLIBC than CentOS 7 buildbox,
-                        # so we must rebuild Rust artifacts from scratch
                         echo "=== Cleaning Rust build artifacts ==="
                         rm -rf target/
                         
-                        # Get UID/GID for proper file permissions
-                        export UID=$(id -u)
-                        export GID=$(id -g)
+                        echo "=== Building Teleport binaries inside Docker ==="
                         
-                        # Build binaries using the CentOS 7 buildbox
-                        # This follows the official build process from build.assets/Makefile
+                        # Build only required binaries (teleport, tctl, tsh, tbot, fdpass-teleport)
+                        # Skip teleport-update as it's removed from Docker image anyway
+                        # Use parallel Go compilation and caching
                         docker run --rm \
                             -v "$(pwd)":/go/src/github.com/gravitational/teleport \
                             -v /tmp:/tmp \
@@ -110,8 +97,9 @@ pipeline {
                             -u ${UID}:${GID} \
                             -e HOME=/tmp \
                             -e GOCACHE=/tmp/go-cache \
+                            -e GOMAXPROCS=${GOMAXPROCS} \
                             ${BUILDBOX_BASE}-centos7:${BUILDBOX_VERSION}-${ARCH} \
-                            make full
+                            make -j${GOMAXPROCS} WEBASSETS_SKIP_BUILD=1 build/teleport build/tctl build/tsh build/tbot build/fdpass-teleport
                         
                         echo "=== Build complete, checking output ==="
                         ls -la build/
@@ -152,9 +140,9 @@ pipeline {
                         # Copy the Dockerfile to build directory
                         cp ./build.assets/charts/Dockerfile build/
                         
-                        # Build the Docker image
+                        # Build the Docker image (enable BuildKit for --mount support)
                         cd build
-                        docker build --no-cache . \
+                        DOCKER_BUILDKIT=1 docker build --no-cache . \
                             -t ${DOCKER_REGISTRY}:${TAG_PUSH_VERSION} \
                             --target teleport \
                             --build-arg DEB_PATH="./teleport_${VERSION}_${ARCH}.deb"
