@@ -14,8 +14,11 @@ pipeline {
     environment {
         GIT_CREDENTIALS_ID = 'ec2-user'
         DOCKER_REGISTRY = 'intranet.fredhopper.com/teleport'
-        // Architecture for the build (amd64, arm64)
+        // Architecture for the build
         ARCH = 'amd64'
+        // Teleport buildbox version (must match the version in build.assets/images.mk)
+        BUILDBOX_VERSION = 'teleport18'
+        BUILDBOX_BASE = 'ghcr.io/gravitational/teleport-buildbox'
     }
     stages {
         stage('Prepare Workspace') {
@@ -39,15 +42,70 @@ pipeline {
                 }
             }
         }
+        stage('Pull Buildbox Images') {
+            steps {
+                sh '''
+                    echo "=== Pulling pre-built buildbox images from GitHub Container Registry ==="
+                    
+                    # Pull the CentOS 7 buildbox (for compiling Go binaries)
+                    docker pull ${BUILDBOX_BASE}-centos7:${BUILDBOX_VERSION}-${ARCH}
+                    
+                    # Pull the Node.js buildbox (for building web UI)
+                    docker pull ${BUILDBOX_BASE}-node:${BUILDBOX_VERSION}
+                    
+                    echo "=== Buildbox images pulled successfully ==="
+                    docker images | grep teleport-buildbox
+                '''
+            }
+        }
+        stage('Build Web Assets') {
+            steps {
+                dir('teleport') {
+                    sh '''
+                        echo "=== Building web assets inside Docker ==="
+                        
+                        # Get UID/GID for proper file permissions
+                        export UID=$(id -u)
+                        export GID=$(id -g)
+                        
+                        # Build webassets using the Node.js buildbox
+                        # This follows the official build process from build.assets/Makefile
+                        docker run --rm \
+                            -v "$(pwd)":/go/src/github.com/gravitational/teleport \
+                            -v /tmp:/tmp \
+                            -w /go/src/github.com/gravitational/teleport \
+                            -u ${UID}:${GID} \
+                            -e HOME=/tmp \
+                            ${BUILDBOX_BASE}-node:${BUILDBOX_VERSION} \
+                            make ensure-webassets
+                        
+                        echo "=== Web assets built successfully ==="
+                        ls -la webassets/ || echo "webassets directory not found, checking web/packages"
+                    '''
+                }
+            }
+        }
         stage('Build Binaries') {
             steps {
                 dir('teleport') {
                     sh '''
-                        echo "=== Building Teleport binaries using official build process ==="
+                        echo "=== Building Teleport binaries inside Docker ==="
                         
-                        # Build binaries inside Docker (uses CentOS 7 buildbox for glibc compatibility)
-                        # This also builds webassets (web UI)
-                        make docker-binaries
+                        # Get UID/GID for proper file permissions
+                        export UID=$(id -u)
+                        export GID=$(id -g)
+                        
+                        # Build binaries using the CentOS 7 buildbox
+                        # This follows the official build process from build.assets/Makefile
+                        docker run --rm \
+                            -v "$(pwd)":/go/src/github.com/gravitational/teleport \
+                            -v /tmp:/tmp \
+                            -w /go/src/github.com/gravitational/teleport \
+                            -u ${UID}:${GID} \
+                            -e HOME=/tmp \
+                            -e GOCACHE=/tmp/go-cache \
+                            ${BUILDBOX_BASE}-centos7:${BUILDBOX_VERSION}-${ARCH} \
+                            make full
                         
                         echo "=== Build complete, checking output ==="
                         ls -la build/
@@ -59,10 +117,25 @@ pipeline {
             steps {
                 dir('teleport') {
                     sh '''
-                        echo "=== Creating DEB package ==="
+                        echo "=== Creating DEB package inside Docker ==="
                         
-                        # Build the .deb package needed for the Docker image
-                        make oss-deb ARCH=${ARCH}
+                        # Get the version from the Makefile
+                        VERSION=$(grep "^VERSION=" Makefile | cut -d= -f2)
+                        echo "Teleport version: ${VERSION}"
+                        
+                        # Get UID/GID for proper file permissions
+                        export UID=$(id -u)
+                        export GID=$(id -g)
+                        
+                        # Create DEB package using the CentOS 7 buildbox
+                        docker run --rm \
+                            -v "$(pwd)":/go/src/github.com/gravitational/teleport \
+                            -v /tmp:/tmp \
+                            -w /go/src/github.com/gravitational/teleport \
+                            -u ${UID}:${GID} \
+                            -e HOME=/tmp \
+                            ${BUILDBOX_BASE}-centos7:${BUILDBOX_VERSION}-${ARCH} \
+                            make deb
                         
                         echo "=== DEB package created ==="
                         ls -la build/*.deb
@@ -73,29 +146,26 @@ pipeline {
         stage('Build Docker Image') {
             steps {
                 dir('teleport') {
-                    withCredentials([usernamePassword(credentialsId: 'github-automation-test', 
-                                                       usernameVariable: 'USERNAME', 
-                                                       passwordVariable: 'PASSWORD')]) {
-                        sh '''
-                            echo "=== Building Docker image ==="
-                            
-                            VERSION=$(make print-version)
-                            echo "Teleport version: ${VERSION}"
-                            
-                            # Copy the Dockerfile to build directory
-                            cp ./build.assets/charts/Dockerfile build/
-                            
-                            # Build the Docker image
-                            cd build
-                            docker build --no-cache . \
-                                -t ${DOCKER_REGISTRY}:${TAG_PUSH_VERSION} \
-                                --target teleport \
-                                --build-arg DEB_PATH="./teleport_${VERSION}_${ARCH}.deb"
-                            
-                            echo "=== Docker image built successfully ==="
-                            docker images | grep ${DOCKER_REGISTRY}
-                        '''
-                    }
+                    sh '''
+                        echo "=== Building Docker image ==="
+                        
+                        # Get the version from the Makefile
+                        VERSION=$(grep "^VERSION=" Makefile | cut -d= -f2)
+                        echo "Teleport version: ${VERSION}"
+                        
+                        # Copy the Dockerfile to build directory
+                        cp ./build.assets/charts/Dockerfile build/
+                        
+                        # Build the Docker image
+                        cd build
+                        docker build --no-cache . \
+                            -t ${DOCKER_REGISTRY}:${TAG_PUSH_VERSION} \
+                            --target teleport \
+                            --build-arg DEB_PATH="./teleport_${VERSION}_${ARCH}.deb"
+                        
+                        echo "=== Docker image built successfully ==="
+                        docker images | grep ${DOCKER_REGISTRY}
+                    '''
                 }
             }
         }
@@ -115,6 +185,8 @@ pipeline {
             sh '''
                 # Clean up Docker images to save space
                 docker rmi ${DOCKER_REGISTRY}:${TAG_PUSH_VERSION} || true
+                docker rmi ${BUILDBOX_BASE}-centos7:${BUILDBOX_VERSION}-${ARCH} || true
+                docker rmi ${BUILDBOX_BASE}-node:${BUILDBOX_VERSION} || true
                 docker system prune -f || true
             '''
         }
