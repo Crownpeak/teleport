@@ -3,6 +3,7 @@
  * These plugins cause issues with Node.js ESM compatibility in the Docker build environment
  */
 const fs = require('fs');
+const path = require('path');
 
 const configPath = 'web/packages/build/vite/config.ts';
 let content = fs.readFileSync(configPath, 'utf8');
@@ -48,6 +49,23 @@ content = content.replace("import wasm from 'vite-plugin-wasm';\n", '');
 
 // Remove wasm() from plugins array
 content = content.replace('        wasm(),\n', '');
+
+// Add resolve alias for ironrdp to help Vite find the WASM module
+// Insert after the 'define' block in the config object
+const defineBlock = `      define: {
+        'process.env': { NODE_ENV: process.env.NODE_ENV },
+      },
+    };`;
+const defineBlockWithResolve = `      define: {
+        'process.env': { NODE_ENV: process.env.NODE_ENV },
+      },
+      resolve: {
+        alias: {
+          'shared/libs/ironrdp/pkg/ironrdp': resolve(rootDirectory, 'web/packages/shared/libs/ironrdp/pkg/ironrdp.js'),
+        },
+      },
+    };`;
+content = content.replace(defineBlock, defineBlockWithResolve);
 
 fs.writeFileSync(configPath, content);
 console.log('Patched vite config successfully');
