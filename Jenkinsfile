@@ -91,6 +91,12 @@ pipeline {
                     sh '''
                         echo "=== Building Teleport binaries inside Docker ==="
                         
+                        # Clean Rust target directory to avoid GLIBC version conflicts
+                        # The Node.js buildbox has newer GLIBC than CentOS 7 buildbox,
+                        # so we must rebuild Rust artifacts from scratch
+                        echo "=== Cleaning Rust build artifacts ==="
+                        rm -rf target/
+                        
                         # Get UID/GID for proper file permissions
                         export UID=$(id -u)
                         export GID=$(id -g)
