@@ -40,6 +40,17 @@ pipeline {
                         git clone --depth 1 --branch "${CHECKOUT_BRANCH}" https://github.com/Crownpeak/teleport
                         cd teleport
                         git log -1 --oneline
+                        
+                        # Verify OIDC/SAML entitlement fix is present
+                        echo "=== Verifying OIDC/SAML entitlement fix ==="
+                        if grep -q "Always enable OIDC and SAML for OSS builds" lib/modules/modules.go; then
+                            echo "✓ OIDC/SAML entitlement fix is present in the code"
+                        else
+                            echo "✗ ERROR: OIDC/SAML entitlement fix NOT found!"
+                            echo "Content of GetEntitlement function:"
+                            grep -A 10 "func (f Features) GetEntitlement" lib/modules/modules.go
+                            exit 1
+                        fi
                     '''
                 }
             }
@@ -84,6 +95,11 @@ pipeline {
                         # Clean Rust target directory to avoid GLIBC version conflicts
                         echo "=== Cleaning Rust build artifacts ==="
                         rm -rf target/
+                        
+                        # Clean Go build cache to ensure fresh compilation
+                        echo "=== Cleaning Go build cache ==="
+                        rm -rf /tmp/go-cache || true
+                        rm -rf build/ || true
                         
                         echo "=== Building Teleport binaries inside Docker ==="
                         
