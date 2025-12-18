@@ -1,0 +1,27 @@
+FROM ubuntu:20.04
+
+# Install dependencies
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y \
+    ca-certificates dumb-init && \
+    update-ca-certificates && \
+    apt-get -y clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy binaries directly
+COPY teleport /usr/local/bin/teleport
+COPY tctl /usr/local/bin/tctl
+COPY tsh /usr/local/bin/tsh
+
+# Create teleport user and directories
+RUN groupadd -r teleport && \
+    useradd -r -g teleport -d /var/lib/teleport -s /bin/bash teleport && \
+    mkdir -p /var/lib/teleport /etc/teleport && \
+    chown -R teleport:teleport /var/lib/teleport /etc/teleport
+
+EXPOSE 3023/tcp 3024/tcp 3025/tcp 3080/tcp
+
+WORKDIR /var/lib/teleport
+
+ENTRYPOINT ["/usr/bin/dumb-init", "/usr/local/bin/teleport", "start"]
+CMD []
