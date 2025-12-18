@@ -23,5 +23,6 @@ EXPOSE 3023/tcp 3024/tcp 3025/tcp 3080/tcp
 
 WORKDIR /var/lib/teleport
 
-ENTRYPOINT ["/usr/bin/dumb-init", "/usr/local/bin/teleport", "start"]
+# Match official teleport-distroless image entrypoint
+ENTRYPOINT ["/usr/bin/dumb-init", "/usr/local/bin/teleport", "start", "-c", "/etc/teleport/teleport.yaml"]
 CMD []

@@ -1,0 +1,56 @@
+# OIDC Connector for Keycloak
+# Apply after Teleport is running:
+#   kubectl exec -n teleport deploy/teleport -- tctl create /tmp/oidc.yaml
+#
+# Or copy this file to the pod and apply:
+#   kubectl cp oidc-connectors.yaml teleport/<pod-name>:/tmp/oidc.yaml
+#   kubectl exec -n teleport <pod-name> -- tctl create /tmp/oidc.yaml
+---
+kind: oidc
+version: v3
+metadata:
+  name: keycloak
+spec:
+  # IMPORTANT: Update these values for your Keycloak instance
+  issuer_url: "https://keycloak.example.com/realms/master"
+  client_id: "teleport"
+  client_secret: "your-keycloak-client-secret"
+  # Must match your public_addr in teleport.yaml
+  redirect_url: "https://teleport.example.com/v1/webapi/oidc/callback"
+  display: "Login with Keycloak"
+  scope: ["openid", "email", "profile", "groups"]
+  claims_to_roles:
+    # Map Keycloak groups to Teleport roles
+    - claim: "groups"
+      value: "admins"
+      roles: ["access", "editor", "admin"]
+    - claim: "groups"
+      value: "developers"
+      roles: ["access", "editor"]
+    - claim: "groups"
+      value: "users"
+      roles: ["access"]
+    # Fallback for any authenticated user
+    - claim: "email"
+      value: "*"
+      roles: ["access"]
+---
+# Optional: Google OIDC Connector
+kind: oidc
+version: v3
+metadata:
+  name: google
+spec:
+  issuer_url: "https://accounts.google.com"
+  client_id: "your-google-client-id.apps.googleusercontent.com"
+  client_secret: "your-google-client-secret"
+  redirect_url: "https://teleport.example.com/v1/webapi/oidc/callback"
+  display: "Login with Google"
+  scope: ["openid", "email", "profile"]
+  claims_to_roles:
+    - claim: "hd"
+      value: "example.com"
+      roles: ["access", "editor"]
+    - claim: "email"
+      value: "*@example.com"
+      roles: ["access"]
