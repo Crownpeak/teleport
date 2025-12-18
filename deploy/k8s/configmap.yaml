@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: teleport-config
+  namespace: teleport
+data:
+  teleport.yaml: |
+    version: v3
+    teleport:
+      nodename: teleport
+      data_dir: /var/lib/teleport
+      log:
+        output: stderr
+        severity: INFO
+
+    auth_service:
+      enabled: true
+      listen_addr: 0.0.0.0:3025
+      # IMPORTANT: Change this to your actual cluster name
+      cluster_name: teleport.example.com
+      proxy_listener_mode: multiplex
+      authentication:
+        type: local
+        second_factor: "off"
+        # Uncomment to set OIDC as default
+        # connector_name: keycloak
+
+    proxy_service:
+      enabled: true
+      web_listen_addr: 0.0.0.0:3080
+      # IMPORTANT: Change to your actual public address
+      public_addr: teleport.example.com:443
+      # For TLS termination at ingress
+      https_keypairs: []
+
+    ssh_service:
+      enabled: false
+
+    kubernetes_service:
+      enabled: false

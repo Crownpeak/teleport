@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: teleport
+  namespace: teleport
+  labels:
+    app: teleport
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: teleport
+  template:
+    metadata:
+      labels:
+        app: teleport
+    spec:
+      containers:
+        - name: teleport
+          image: intranet.fredhopper.com/teleport:18.5.1
+          imagePullPolicy: Always
+          args:
+            - "-c"
+            - "/etc/teleport/teleport.yaml"
+          ports:
+            - name: web
+              containerPort: 3080
+              protocol: TCP
+            - name: auth
+              containerPort: 3025
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/teleport
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/teleport
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 3080
+              scheme: HTTPS
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 3080
+              scheme: HTTPS
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+      volumes:
+        - name: config
+          configMap:
+            name: teleport-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: teleport-data
+      securityContext:
+        fsGroup: 1000
