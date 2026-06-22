@@ -48,6 +48,7 @@ import (
 	"github.com/gravitational/teleport/lib/backend/memory"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/events/eventstest"
+	"github.com/gravitational/teleport/lib/modules"
 	"github.com/gravitational/teleport/lib/services"
 )
 
@@ -97,11 +98,14 @@ func setupOIDCContext(ctx context.Context, t *testing.T) *oidcContext {
 		require.NoError(t, tt.b.Close())
 	})
 
+	keygen, err := authority.NewKeygen(modules.GetModules().BuildType(), tt.c.Now)
+	require.NoError(t, err)
+
 	authConfig := &auth.InitConfig{
 		ClusterName:            clusterName,
 		Backend:                tt.b,
 		VersionStorage:         authtest.NewFakeTeleportVersion(),
-		Authority:              authority.New(),
+		Authority:              keygen,
 		SkipPeriodicOperations: true,
 		HostUUID:               uuid.NewString(),
 	}
