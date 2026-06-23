@@ -189,8 +189,11 @@ pipeline {
                 sh '''
                     echo "=== Verifying OIDC/SAML are enabled in the Docker image ==="
                     
-                    # Run a quick test to verify entitlements
-                    docker run --rm ${DOCKER_REGISTRY}:${TAG_PUSH_VERSION} version
+                    # Run a quick test to verify entitlements.
+                    # The image ENTRYPOINT is "teleport start -c ...", so we must
+                    # override it to invoke "teleport version" directly, otherwise
+                    # "version" is appended to "start" and teleport rejects it.
+                    docker run --rm --entrypoint /usr/local/bin/teleport ${DOCKER_REGISTRY}:${TAG_PUSH_VERSION} version
                     
                     echo "=== Image verification complete ==="
                 '''
