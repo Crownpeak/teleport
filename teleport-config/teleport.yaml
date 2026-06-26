@@ -1,0 +1,22 @@
+version: v3
+teleport:
+  nodename: teleport.local
+  data_dir: /var/lib/teleport
+  log:
+    output: stderr
+    severity: INFO
+
+auth_service:
+  enabled: true
+  listen_addr: 0.0.0.0:3025
+  cluster_name: teleport.local
+
+proxy_service:
+  enabled: true
+  web_listen_addr: 0.0.0.0:3080
+  public_addr: localhost:3080
+  ssh_public_addr: localhost:3023
+
+ssh_service:
+  enabled: true
+  listen_addr: 0.0.0.0:3022
