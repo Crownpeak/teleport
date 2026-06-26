@@ -70,6 +70,35 @@ pipeline {
                 '''
             }
         }
+        stage('Run Unit Tests') {
+            steps {
+                dir('teleport') {
+                    sh '''
+                        echo "=== Running fork OIDC/SAML canary unit tests ==="
+
+                        export UID=$(id -u)
+                        export GID=$(id -g)
+
+                        mkdir -p /tmp/go-cache-teleport /tmp/gomodcache-teleport
+
+                        docker run --rm \
+                            -v "$(pwd)":/go/src/github.com/gravitational/teleport \
+                            -v /tmp/go-cache-teleport:/tmp/go-cache \
+                            -v /tmp/gomodcache-teleport:/tmp/gomodcache \
+                            -w /go/src/github.com/gravitational/teleport \
+                            -u ${UID}:${GID} \
+                            -e HOME=/tmp \
+                            -e GOCACHE=/tmp/go-cache \
+                            -e GOMODCACHE=/tmp/gomodcache \
+                            -e GOMAXPROCS=${GOMAXPROCS} \
+                            ${BUILDBOX_BASE}-centos7:${BUILDBOX_VERSION}-${ARCH} \
+                            go test ./lib/modules/... -race -v
+
+                        echo "=== Unit tests passed ==="
+                    '''
+                }
+            }
+        }
         stage('Build Web Assets') {
             steps {
                 dir('teleport') {
