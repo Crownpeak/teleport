@@ -267,8 +267,10 @@ func TestFeatures_GetEntitlement(t *testing.T) {
 	actual = f.GetEntitlement(entitlements.K8s)
 	require.Equal(t, modules.EntitlementInfo{Enabled: false}, actual)
 
+	// Crownpeak fork: SAML is force-enabled regardless of the entitlement map.
+	// See GetEntitlement in modules.go — both OIDC and SAML always return Enabled:true.
 	actual = f.GetEntitlement(entitlements.SAML)
-	require.Equal(t, modules.EntitlementInfo{}, actual)
+	require.Equal(t, modules.EntitlementInfo{Enabled: true}, actual)
 
 	actual = f.GetEntitlement(entitlements.UsageReporting)
 	require.Equal(t, modules.EntitlementInfo{}, actual)
