@@ -107,19 +107,9 @@ targetRevision: 18.8.0   →   targetRevision: 18.9.0
 
 Merge the PR. ArgoCD auto-deploys within minutes. Verify OIDC login works on the dev cluster.
 
-### Production
+### Production — root and leaf clusters
 
-In `argo-app-config`, update:
-```
-aws-account/fms/zones/fdp-utils/eu-west-1/eks-cluster/fdp-produtil-main-eks-eu-west-1/shared-infra-utils/teleport-cluster.yaml
-```
-
-Change:
-```yaml
-targetRevision: 18.8.0   →   targetRevision: 18.9.0
-```
-
-Merge only after dev cluster is verified.
+Once dev is verified, bump `targetRevision` in **all** production `teleport-cluster.yaml` manifests across AWS accounts — both the root cluster and all adjacent leaf clusters.
 
 > **Warning:** Production ArgoCD has `prune: true` and `selfHeal: true` — it redeploys immediately on merge. Only merge after the image is confirmed pushed and dev is green.
 
