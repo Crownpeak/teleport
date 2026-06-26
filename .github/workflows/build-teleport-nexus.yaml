@@ -1,0 +1,165 @@
+name: Build and Push Teleport Image
+run-name: Build Teleport ${{ github.ref_name }} and push to Nexus
+
+on:
+  push:
+    branches:
+      - add-oidc-support-v18.5.1-v2
+      - add-oidc-support
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_version:
+        description: 'Docker image tag version (e.g., 18.5.1-oidc)'
+        required: true
+        default: '18.5.1-oidc'
+
+env:
+  DOCKER_REGISTRY: intranet.fredhopper.com/teleport
+  ARCH: amd64
+  # Teleport buildbox version (must match the version in build.assets/images.mk)
+  BUILDBOX_VERSION: teleport18
+  BUILDBOX_BASE: ghcr.io/gravitational/teleport-buildbox
+
+jobs:
+  build-and-push:
+    name: Build and Push Teleport Image
+    runs-on: ubuntu-22.04-32core
+
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
+
+      - name: Determine version tag
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag_version }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            # Strip 'v' prefix from tag if present
+            TAG="${GITHUB_REF_NAME#v}"
+            echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          else
+            # Use branch name + short SHA for branch builds
+            SHORT_SHA=$(git rev-parse --short HEAD)
+            BRANCH_NAME=$(echo "${{ github.ref_name }}" | sed 's/\//-/g')
+            echo "tag=${BRANCH_NAME}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Get Teleport version from Makefile
+        id: teleport-version
+        run: |
+          VERSION=$(grep "^VERSION=" Makefile | cut -d= -f2)
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Teleport version: ${VERSION}"
+
+      - name: Login to GitHub Container Registry (for buildbox images)
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Nexus Registry
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: intranet.fredhopper.com
+          username: ${{ secrets.NEXUS_USERNAME }}
+          password: ${{ secrets.NEXUS_PASSWORD }}
+
+      - name: Pull buildbox images
+        run: |
+          echo "=== Pulling pre-built buildbox images ==="
+          docker pull ${{ env.BUILDBOX_BASE }}-centos7:${{ env.BUILDBOX_VERSION }}-${{ env.ARCH }}
+          docker pull ${{ env.BUILDBOX_BASE }}-node:${{ env.BUILDBOX_VERSION }}
+          echo "=== Buildbox images pulled ==="
+          docker images | grep teleport-buildbox
+
+      - name: Build web assets inside Docker
+        run: |
+          echo "=== Building web assets inside Docker ==="
+          docker run --rm \
+            -v "$(pwd)":/go/src/github.com/gravitational/teleport \
+            -v /tmp:/tmp \
+            -w /go/src/github.com/gravitational/teleport \
+            -u $(id -u):$(id -g) \
+            -e HOME=/tmp \
+            ${{ env.BUILDBOX_BASE }}-node:${{ env.BUILDBOX_VERSION }} \
+            make ensure-webassets
+          echo "=== Web assets built ==="
+
+      - name: Build binaries inside Docker
+        run: |
+          echo "=== Building Teleport binaries inside Docker ==="
+          docker run --rm \
+            -v "$(pwd)":/go/src/github.com/gravitational/teleport \
+            -v /tmp:/tmp \
+            -w /go/src/github.com/gravitational/teleport \
+            -u $(id -u):$(id -g) \
+            -e HOME=/tmp \
+            -e GOCACHE=/tmp/go-cache \
+            ${{ env.BUILDBOX_BASE }}-centos7:${{ env.BUILDBOX_VERSION }}-${{ env.ARCH }} \
+            make full
+          echo "=== Binaries built ==="
+          ls -la build/
+
+      - name: Create DEB package inside Docker
+        run: |
+          echo "=== Creating DEB package inside Docker ==="
+          docker run --rm \
+            -v "$(pwd)":/go/src/github.com/gravitational/teleport \
+            -v /tmp:/tmp \
+            -w /go/src/github.com/gravitational/teleport \
+            -u $(id -u):$(id -g) \
+            -e HOME=/tmp \
+            ${{ env.BUILDBOX_BASE }}-centos7:${{ env.BUILDBOX_VERSION }}-${{ env.ARCH }} \
+            make deb
+          echo "=== DEB package created ==="
+          ls -la build/*.deb
+
+      - name: Build Docker image
+        run: |
+          VERSION=${{ steps.teleport-version.outputs.version }}
+          TAG=${{ steps.version.outputs.tag }}
+
+          echo "=== Building Docker image ==="
+          echo "Teleport version: ${VERSION}"
+          echo "Image tag: ${TAG}"
+
+          # Copy Dockerfile to build directory
+          cp ./build.assets/charts/Dockerfile build/
+
+          # Build the Docker image
+          cd build
+          docker build --no-cache . \
+            -t ${{ env.DOCKER_REGISTRY }}:${TAG} \
+            --target teleport \
+            --build-arg DEB_PATH="./teleport_${VERSION}_${{ env.ARCH }}.deb"
+
+          echo "=== Docker image built ==="
+          docker images | grep ${{ env.DOCKER_REGISTRY }}
+
+      - name: Push Docker image
+        run: |
+          TAG=${{ steps.version.outputs.tag }}
+          echo "=== Pushing image to Nexus ==="
+          docker push ${{ env.DOCKER_REGISTRY }}:${TAG}
+          echo "=== Image pushed ==="
+          echo "Image: ${{ env.DOCKER_REGISTRY }}:${TAG}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean up
+        if: always()
+        run: |
+          TAG=${{ steps.version.outputs.tag }}
+          docker rmi ${{ env.DOCKER_REGISTRY }}:${TAG} || true
+          docker rmi ${{ env.BUILDBOX_BASE }}-centos7:${{ env.BUILDBOX_VERSION }}-${{ env.ARCH }} || true
+          docker rmi ${{ env.BUILDBOX_BASE }}-node:${{ env.BUILDBOX_VERSION }} || true
+          docker system prune -f || true
