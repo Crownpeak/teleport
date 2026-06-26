@@ -1,0 +1,178 @@
+# Dockerfile for building and running Teleport OSS v18.5.1 locally with maximum caching
+# This builds everything including web UI, but caches aggressively for fast rebuilds
+#
+# Build stages:
+#   1. builder-base: System dependencies (Go, Node.js) - cached indefinitely
+#   2. go-deps: Go module download - cached until go.mod/go.sum change
+#   3. js-deps: Node/pnpm dependencies - cached until package files change
+#   4. ui-builder: Build web UI - cached until web/ changes (wasm stage removed for v18.5.1)
+#   5. go-builder: Build Go binaries - cached until *.go changes
+#   6. runtime: Final minimal image
+#
+# Note: Rust/WASM build stage removed as ironrdp components are not present in v18.5.1
+
+##############################################################################
+# Stage 1: Base builder with all system dependencies (cached indefinitely)
+##############################################################################
+FROM golang:1.23-bullseye AS builder-base
+
+ENV GOTOOLCHAIN=auto
+
+# Install all build dependencies in one layer
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+    git \
+    libpam0g-dev \
+    libfido2-dev \
+    pkg-config \
+    zip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Note: Rust and wasm32 target removed as not needed for v18.5.1
+# If needed for newer versions, uncomment below:
+# RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+# ENV PATH="/root/.cargo/bin:${PATH}"
+# RUN rustup target add wasm32-unknown-unknown
+
+# Install Node.js
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -y nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
+##############################################################################
+# Stage 2: Download Go dependencies (cached until go.mod/go.sum change)
+##############################################################################
+FROM builder-base AS go-deps
+
+WORKDIR /teleport
+
+COPY go.mod go.sum ./
+COPY api/go.mod api/go.sum ./api/
+
+RUN go mod download
+
+##############################################################################
+# Stage 3: Install JS dependencies (cached until package files change)
+##############################################################################
+FROM builder-base AS js-deps
+
+WORKDIR /teleport
+
+# Copy package files and pnpm config
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .pnpmfile.cjs .npmrc ./
+
+# Copy web directory structure needed for pnpm workspace
+COPY web/patches ./web/patches
+COPY web/packages/design/package.json ./web/packages/design/
+COPY web/packages/teleport/package.json ./web/packages/teleport/
+COPY web/packages/shared/package.json ./web/packages/shared/
+COPY web/packages/build/package.json ./web/packages/build/
+COPY web/packages/teleterm/package.json ./web/packages/teleterm/
+
+# Install pnpm and dependencies
+RUN corepack enable pnpm && \
+    pnpm install --frozen-lockfile
+
+##############################################################################
+# Stage 4: Build wasm module (DISABLED - not available in v18.5.1)
+##############################################################################
+# Note: Rust/WASM components (ironrdp) are not present in Teleport v18.5.1
+# The wasm-builder stage has been removed. If needed for newer versions,
+# uncomment and ensure Cargo.toml, Cargo.lock, and rust-toolchain.toml exist.
+
+##############################################################################
+# Stage 4: Build web UI (cached until web/ source changes)
+##############################################################################
+FROM js-deps AS ui-builder
+
+WORKDIR /teleport
+
+# Note: WASM artifacts not copied as they don't exist in v18.5.1
+
+# Copy all root tsconfig files for TypeScript path resolution
+COPY tsconfig.json tsconfig.base.json tsconfig.node.json ./
+
+# Copy generated protobuf TypeScript files (required by web UI)
+COPY gen ./gen
+
+# Copy web source code
+COPY web ./web
+
+# Patch package.json to skip WASM build (not present in v18.5.1)
+RUN sed -i 's/"build": "pnpm build-wasm && vite build"/"build": "vite build"/' web/packages/teleport/package.json && \
+    sed -i 's/"start": "pnpm build-wasm && vite"/"start": "vite"/' web/packages/teleport/package.json
+
+# Fix ES module imports for Node.js compatibility
+# Use node script to safely remove problematic plugins without breaking syntax
+COPY build.assets/patch-vite-config.js /tmp/patch-vite-config.js
+RUN node /tmp/patch-vite-config.js && \
+    rm -rf node_modules/.vite* web/packages/*/node_modules/.vite*
+
+# Build web UI (disable compression to avoid plugin issues)
+ENV VITE_DISABLE_COMPRESSION=1
+RUN pnpm build-ui-oss
+
+##############################################################################
+# Stage 5: Build Go binaries (cached until *.go changes)
+##############################################################################
+FROM go-deps AS go-builder
+
+WORKDIR /teleport
+
+# Copy all source code
+COPY . .
+
+# Copy webassets from ui-builder (must be after COPY . to overwrite any local webassets)
+COPY --from=ui-builder /teleport/webassets ./webassets
+
+# Create SHA marker file to prevent webassets rebuild
+# The build script checks this file to determine if webassets need rebuilding
+# Calculate SHA the same way the build script does and save it
+RUN find ./web ./package.json ./pnpm-lock.yaml \
+    -not \( -type d \( -name node_modules -o -name .swc -o -name .storybook \) -prune \) \
+    -type f -print0 | \
+    LC_ALL=C sort -z | xargs -0 sha512sum | awk '{print $1}' | sha512sum | tr -d ' -' > webassets/oss-sha
+
+# Build all Go binaries with embedded webassets
+RUN GOTOOLCHAIN=auto make all
+
+##############################################################################
+# Stage 6: Runtime image
+##############################################################################
+FROM debian:bullseye-slim
+
+# Install runtime dependencies
+RUN apt-get update && \
+    apt-get install -y \
+    ca-certificates \
+    dumb-init \
+    libfido2-1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy built binaries from go-builder stage
+COPY --from=go-builder /teleport/build/teleport /usr/local/bin/teleport
+COPY --from=go-builder /teleport/build/tctl /usr/local/bin/tctl
+COPY --from=go-builder /teleport/build/tsh /usr/local/bin/tsh
+
+# Create teleport user and directories
+RUN groupadd -r teleport && \
+    useradd -r -g teleport -d /var/lib/teleport -s /bin/bash teleport && \
+    mkdir -p /var/lib/teleport /etc/teleport && \
+    chown -R teleport:teleport /var/lib/teleport /etc/teleport
+
+# Expose ports
+# 3023 - SSH proxy
+# 3024 - SSH reverse tunnel
+# 3025 - Auth service
+# 3080 - Web UI and API
+EXPOSE 3023 3024 3025 3080
+
+# Set working directory
+WORKDIR /var/lib/teleport
+
+# Use dumb-init to handle signals properly
+ENTRYPOINT ["/usr/bin/dumb-init", "--"]
+
+# Default command
+CMD ["/usr/local/bin/teleport", "start"]
