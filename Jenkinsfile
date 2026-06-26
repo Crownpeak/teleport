@@ -7,9 +7,9 @@ pipeline {
     }
     parameters {
         string(name: 'CHECKOUT_BRANCH',
-               defaultValue: 'add-oidc-support-v18.7.6')
+               defaultValue: 'add-oidc-support-v18.8.0')
         string(name: 'TAG_PUSH_VERSION',
-               defaultValue: '18.7.6')
+               defaultValue: '18.8.0')
     }
     environment {
         GIT_CREDENTIALS_ID = 'ec2-user'
