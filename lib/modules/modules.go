@@ -196,6 +196,12 @@ func (f Features) EntitlementsToProto() map[string]*proto.EntitlementInfo {
 
 // GetEntitlement takes an entitlement and returns either the Features entitlement, or if not present, a false entitlement
 func (f Features) GetEntitlement(e entitlements.EntitlementKind) EntitlementInfo {
+	// Always enable OIDC and SAML for OSS builds to allow SSO authentication
+	// without enterprise licensing. This is a Crownpeak fork modification.
+	if e == entitlements.OIDC || e == entitlements.SAML {
+		return EntitlementInfo{Enabled: true, Limit: 0}
+	}
+
 	al, ok := f.Entitlements[e]
 	if !ok {
 		return EntitlementInfo{}
@@ -210,6 +216,12 @@ func (f Features) GetEntitlement(e entitlements.EntitlementKind) EntitlementInfo
 // GetProtoEntitlement takes a proto features set and an entitlement and returns either the proto features entitlement,
 // or if not present, a false entitlement
 func GetProtoEntitlement(f *proto.Features, e entitlements.EntitlementKind) *proto.EntitlementInfo {
+	// Always enable OIDC and SAML for OSS builds to allow SSO authentication
+	// without enterprise licensing. This is a Crownpeak fork modification.
+	if e == entitlements.OIDC || e == entitlements.SAML {
+		return &proto.EntitlementInfo{Enabled: true, Limit: 0}
+	}
+
 	fE := f.GetEntitlements()
 	al, ok := fE[string(e)]
 	if !ok {
@@ -425,6 +437,8 @@ func (p *defaultModules) Features() Features {
 			entitlements.Desktop:            {Enabled: true, Limit: 0},
 			entitlements.JoinActiveSessions: {Enabled: true, Limit: 0},
 			entitlements.K8s:                {Enabled: true, Limit: 0},
+			entitlements.OIDC:               {Enabled: true, Limit: 0},
+			entitlements.SAML:               {Enabled: true, Limit: 0},
 		},
 	}
 }
