@@ -38,6 +38,24 @@ pipeline {
                             grep -A 10 "func (f Features) GetEntitlement" lib/modules/modules.go
                             exit 1
                         fi
+
+                        # Verify fork OIDC service file exists
+                        echo "=== Verifying OIDC service file ==="
+                        if [ -f lib/auth/oidc_service.go ]; then
+                            echo "✓ lib/auth/oidc_service.go present"
+                        else
+                            echo "✗ ERROR: lib/auth/oidc_service.go missing (fork OIDC service dropped?)"
+                            exit 1
+                        fi
+
+                        # Verify OIDC service is registered in NewServer
+                        echo "=== Verifying OIDC service registration ==="
+                        if grep -q "SetOIDCService(NewOIDCAuthService" lib/auth/auth.go; then
+                            echo "✓ OIDC service registration present in auth.go"
+                        else
+                            echo "✗ ERROR: SetOIDCService(NewOIDCAuthService not found in lib/auth/auth.go (registration dropped?)"
+                            exit 1
+                        fi
                     '''
                 }
             }
@@ -212,6 +230,15 @@ pipeline {
                     docker run --rm --entrypoint /usr/local/bin/teleport ${DOCKER_REGISTRY}:${TAG_PUSH_VERSION} version
 
                     echo "=== Image verification complete ==="
+                '''
+            }
+        }
+        stage('OIDC Light Gate') {
+            steps {
+                sh '''
+                    echo "=== Running OIDC runtime light gate ==="
+                    TELEPORT_IMAGE=${DOCKER_REGISTRY}:${TAG_PUSH_VERSION} \
+                        bash teleport/build.assets/oidc-gate/run.sh
                 '''
             }
         }
