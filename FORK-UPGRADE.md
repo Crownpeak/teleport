@@ -56,13 +56,28 @@ git range-diff v18.8.0..crownpeak/v18.8.0  v18.9.0..add-oidc-support-v18.9.0
 
 Lines marked `=` carried over unchanged. Lines with diffs show what had to be adapted. Include this output in the upgrade PR description.
 
-### 6. Run unit tests locally
+### 6. Run tests locally
+
+**Unit canary tests** (fast, ~30s):
 
 ```bash
 go test ./lib/modules/... -race -v
 ```
 
-All tests must pass, especially the `TestFork*` canaries. If any fail, the OIDC patch was lost or broken during the rebase.
+All `TestFork*` tests must pass. If any fail, the OIDC patch was lost or broken during the rebase.
+
+**Runtime light gate** (optional locally, always runs in Jenkins):
+
+```bash
+TELEPORT_IMAGE=intranet.fredhopper.com/teleport:18.9.0 \
+    bash build.assets/oidc-gate/run.sh
+```
+
+Requires the image to already be built. Boots the image and verifies:
+- OIDC connector creation is not Enterprise-gated (entitlement bypass active in binary)
+- OIDC service is registered and responds (not a nil/not-implemented stub)
+
+Jenkins runs this automatically before pushing the image.
 
 ### 7. Tag and push
 
@@ -140,4 +155,8 @@ git rebase --onto vNEW vOLD add-oidc-support-vNEW
 
 # Run fork canary tests
 go test ./lib/modules/... -race -v -run TestFork
+
+# Run runtime light gate (requires built image)
+TELEPORT_IMAGE=intranet.fredhopper.com/teleport:vNEW \
+    bash build.assets/oidc-gate/run.sh
 ```
